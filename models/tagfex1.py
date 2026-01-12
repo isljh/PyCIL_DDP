@@ -10,12 +10,10 @@ from torch.utils.data import DataLoader
 from models.base import BaseLearner
 from utils.inc_net import TagFexNet
 from utils.toolkit import count_parameters, tensor2numpy
-from torchvision import transforms
-from torchvision.transforms.functional import to_pil_image
 
 EPSILON = 1e-8
 
-init_epoch = 600
+init_epoch = 200
 init_lr = 0.1
 init_milestones = [60, 120, 170]
 init_lr_decay = 0.1
@@ -32,51 +30,10 @@ num_workers = 8
 T = 2
 
 
-class SIGReg(nn.Module):
-    """
-    LeJEPA 的核心组件：Sketched Isotropic Gaussian Regularization (SIGReg)
-    该损失函数确保 learned embeddings 符合标准正态分布，从而最小化下游风险。
-    """
-
-    def __init__(self, knots=17):
-        super().__init__()
-        # 初始化积分节点和权重，用于改进的积分近似
-        # 1. 在 [0, 3] 之间切 17 个等距离的点,t就是采样点的位置
-        t = torch.linspace(0, 3, knots, dtype=torch.float32)
-        dt = 3 / (knots - 1)
-        # 2. 设置积分权重（梯形法则）
-        weights = torch.full((knots,), 2 * dt, dtype=torch.float32)
-        weights[[0, -1]] = dt
-        window = torch.exp(-t.square() / 2.0)
-        self.register_buffer("t", t)
-        self.register_buffer("phi", window)  # 目标高斯分布的特征函数
-        self.register_buffer("weights", weights * window)
-
-    def forward(self, proj):
-        device = proj.device
-        # proj(Projected Embeddings投影后的特征向量): [Views, Batch, Dim] 或者是拼接后的特征 [N, Dim][128,1024]
-        # 1. 随机投影到一个子空间（Sketched）
-        A = torch.randn(proj.size(-1), 256, device=device)  # [1024, 256]
-        A = A.div_(A.norm(p=2, dim=0))
-
-        t = self.t.to(device)
-        phi = self.phi.to(device)
-        weights = self.weights.to(device)
-
-        # 2. 计算特征函数并与标准高斯分布对比
-        x_t = (proj @ A).unsqueeze(-1) * t
-        err = (x_t.cos().mean(-3) - phi).square() + x_t.sin().mean(-3).square()
-
-        # 3. 计算统计量
-        statistic = (err @ weights) * proj.size(-2)
-        return statistic.mean()
-
 class TagFex(BaseLearner):
     def __init__(self, args):
         super().__init__(args)
         self._network = TagFexNet(args, False)
-        # --- 新增：实例化 SIGReg ---
-        self.sig_reg = SIGReg(knots=17)
 
     def after_task(self):
         self._known_classes = self._total_classes
@@ -208,102 +165,23 @@ class TagFex(BaseLearner):
         disable_tqdm = (local_rank > 0)
         prog_bar = tqdm(range(init_epoch), disable=disable_tqdm)
 
-        # --- 1. 重新配置符合 LeJEPA 要求的优化器与调度器 ---
-        # 官方建议：主网络与分类头使用不同的超参数
-        # 判断是否被 DDP 包装
-        if hasattr(self._network, "module"):
-            base_model = self._network.module
-        else:
-            base_model = self._network
-
-        params = [
-            {"params": base_model.convnets.parameters(), "lr": 2e-3, "weight_decay": 5e-2},
-            {"params": base_model.fc.parameters(), "lr": 1e-3, "weight_decay": 1e-7}
-        ]
-        optimizer = torch.optim.AdamW(params)
-
-        # 官方要求：必须包含 1 个 Epoch 的线性 Warmup
-        warmup_steps = len(train_loader)
-        total_steps = len(train_loader) * init_epoch
-        s1 = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=0.01, total_iters=warmup_steps)
-        s2 = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_steps - warmup_steps, eta_min=1e-3)
-        scheduler = torch.optim.lr_scheduler.SequentialLR(optimizer, schedulers=[s1, s2], milestones=[warmup_steps])
-
-        V = self.args.get('num_views', 4)
-        lamb = self.args.get('lejepa_lambda', 0.02)
-
-        # 1. 组合随机增强逻辑 (不含 ToTensor)
-        raw_trsf = train_loader.dataset.trsf
-        if isinstance(raw_trsf, transforms.Compose):
-            trsf_list = raw_trsf.transforms
-        else:
-            trsf_list = raw_trsf
-
-        # 过滤掉 Tensor 相关的算子
-        clean_trsf_list = [
-            t for t in trsf_list
-            if not isinstance(t, (transforms.ToTensor, transforms.Normalize))
-        ]
-        train_trsf = transforms.Compose(clean_trsf_list)
-        # 2. 组合标准化逻辑 (ToTensor + Normalize)
-        common_trsf = transforms.Compose([
-            transforms.ToTensor(),
-            transforms.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225))
-        ])
         for _, epoch in enumerate(prog_bar):
             if train_loader.sampler is not None:
                 train_loader.sampler.set_epoch(epoch)
 
             self.train()
             losses, correct, total = 0.0, 0, 0
-            for i, data in enumerate(train_loader):
-                inputs = data[1].to(self._device)
-                targets = data[-1].to(self._device)
-                # --- 防御性检查 ---
-                # 如果这里报错，说明数据源头就错了
-                # --- 调试打印 (仅在第一轮运行, 确认后可删除) ---
-                if i == 0 and epoch == 0 and local_rank <= 0:
-                    logging.info(f"DEBUG: inputs shape {inputs.shape}, targets shape {targets.shape}")
-                # --- [防御性检查] ---
-                # 直接对比 targets 和 inputs 的第一维度，它们必须相等
-                if targets.numel() != inputs.shape[0]:
-                    # 如果还是报错，说明你的 Dataset 返回格式是 (index, data, something_else, target)
-                    # 尝试用 targets = data[-1].to(self._device)
-                    targets = data[-1].to(self._device)
-                    if targets.numel() != inputs.shape[0]:
-                        raise ValueError(f"CRITICAL: Target mapping failed. Data elements: {len(data)}")
-                # --- [核心：生成 V 个视图] ---
-                multi_views = []
-                pil_list = [to_pil_image(img.cpu()) for img in inputs]
-                for _ in range(V):
-                    # 对 Batch 里的每张图独立应用随机增强
-                    view = torch.stack([common_trsf(train_trsf(p_img)) for p_img in pil_list])
-                    multi_views.append(view)
+            for i, (_, inputs1, inputs2, targets) in enumerate(train_loader):
+                inputs1, inputs2, targets = inputs1.to(self._device), inputs2.to(self._device), targets.to(self._device)
+                inputs = torch.cat([inputs1, inputs2], dim=0)
+                targets = torch.cat([targets, targets], dim=0)
 
-                vs = torch.stack(multi_views, dim=1).to(self._device)  # [N, V, 3, 224, 224]
-                N, V_dim = vs.shape[0], vs.shape[1]
-
-                # --- [前向传播] ---
-                out = self._network(vs.flatten(0, 1))
+                out = self._network(inputs)
                 logits, embedding = out["logits"], out["embedding"]
 
-                # --- [LeJEPA 损失计算] ---
-                # 1. 不变性损失 (Invariance)
-                proj = embedding.reshape(N, V_dim, -1)
-                proj_mean = proj.mean(1, keepdim=True)
-                inv_loss = (proj_mean - proj).square().mean()
-
-                # 2. 高斯正则化 (SIGReg)
-                sigreg_loss = self.sig_reg(embedding)
-
-                # 3. 汇总
-                lejepa_loss = sigreg_loss * lamb + inv_loss * (1 - lamb)
-
-                # 4. 分类损失
-                y_rep = targets.repeat_interleave(V_dim)
-                ce_loss = F.cross_entropy(logits, y_rep)
-                loss = ce_loss + lejepa_loss * self.args.get('contrast_factor', 1.0)
-
+                ce_loss = F.cross_entropy(logits, targets)
+                infonce_loss = infoNCE_loss(embedding, self.args['infonce_temp'])
+                loss = ce_loss + infonce_loss * self.args['contrast_factor']
 
                 optimizer.zero_grad()
                 loss.backward()
@@ -311,12 +189,12 @@ class TagFex(BaseLearner):
 
                 losses += loss.item()
                 _, preds = torch.max(logits, dim=1)
-                correct += preds.eq(y_rep).sum().item()
-                total += y_rep.size(0)  # 统计总预测数 (N*V)
+                correct += preds.eq(targets.expand_as(preds)).cpu().sum()
+                total += len(targets)
 
             scheduler.step()
             if not disable_tqdm:
-                train_acc = np.around(correct * 100 / total, decimals=2)
+                train_acc = np.around(tensor2numpy(correct) * 100 / total, decimals=2)
                 prog_bar.set_description(
                     f"Task {self._cur_task}, Epoch {epoch + 1}/{init_epoch} Loss {losses / len(train_loader):.3f}, Acc {train_acc:.2f}")
 

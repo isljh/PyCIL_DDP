@@ -3,7 +3,8 @@ import numpy as np
 from PIL import Image
 from torch.utils.data import Dataset
 from torchvision import transforms
-from utils.data import iCIFAR10, iCIFAR100, iImageNet100, iImageNet1000, iCIFAR10_AA, iCIFAR100_AA
+from utils.data import iCIFAR10, iCIFAR100, iImageNet100, iImageNet1000, iCIFAR10_AA, iCIFAR100_AA, iImageNet100_AA, \
+    iImageNet100_LeJEPA, iCIFAR100_LeJEPA
 from tqdm import tqdm
 import torch
 
@@ -283,6 +284,8 @@ def _get_idata(dataset_name):
         return iCIFAR10()
     elif name == "cifar100":
         return iCIFAR100()
+    elif name == "cifar100_lejepa":
+        return iCIFAR100_LeJEPA()
     elif name == "imagenet1000":
         return iImageNet1000()
     elif name == "imagenet100":
@@ -291,6 +294,10 @@ def _get_idata(dataset_name):
         return iCIFAR100_AA()
     elif name == "cifar10_aa":
         return iCIFAR10_AA()
+    elif name == "imagenet100_aa":  # 添加这一行
+        return iImageNet100_AA()
+    elif name == "imagenet100_lejepa":  # 添加这一行
+        return iImageNet100_LeJEPA()
     else:
         raise NotImplementedError("Unknown dataset {}.".format(dataset_name))
 

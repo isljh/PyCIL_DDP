@@ -1,6 +1,6 @@
 {
     "prefix": "reproduce",
-    "dataset": "cifar100_aa",
+    "dataset": "imagenet100_lejepa",
     "memory_size": 2000,
     "memory_per_class": 20,
     "fixed_memory": false,
@@ -24,5 +24,7 @@
     "transfer_factor":1,
     "aux_factor":2,
     "contrast_kd_factor":2,
-    "aug":2
+    "aug":2,
+    "num_views": 4,
+    "lejepa_lambda": 0.02
 }

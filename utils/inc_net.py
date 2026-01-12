@@ -424,11 +424,26 @@ class SimpleCosineIncrementalNet(BaseNet):
             nb_output = self.fc.out_features
             weight = copy.deepcopy(self.fc.weight.data)
             fc.sigma.data = self.fc.sigma.data
+
+            # --- 核心修复区域：数据不在一个设备 ---
+            # 1. 获取模型权重所在的设备
+            target_device = weight.device
+
+            if nextperiod_initialization is not None:
+                # 确保初始化张量也在目标设备
+                weight = torch.cat([weight, nextperiod_initialization.to(target_device)])
+            else:
+                # 2. 将新的零向量创建在目标设备上
+                new_zeros = torch.zeros(nb_classes - nb_output, self.feature_dim).to(target_device)
+                weight = torch.cat([weight, new_zeros])
+            # --- 修复结束 ---
+            '''
             if nextperiod_initialization is not None:
 
                 weight = torch.cat([weight, nextperiod_initialization])
             else:
                 weight = torch.cat([weight, torch.zeros(nb_classes - nb_output, self.feature_dim).cuda()])
+            '''
             fc.weight = nn.Parameter(weight)
         del self.fc
         self.fc = fc
@@ -1042,8 +1057,8 @@ class DSALNet(ACILNet):
 class TagFexNet(nn.Module):
     def __init__(self, args, pretrained):
         super(TagFexNet, self).__init__()
-        self.convnet_type = args["convnet_type"]
-        self.convnets = nn.ModuleList()
+        self.convnet_type = args["convnet_type"] #模型的backbone:resnet18
+        self.convnets = nn.ModuleList()  # Task-specific Models (fts) 的集合
         self.pretrained = pretrained
         self.out_dim = None
         self.fc = None
@@ -1052,13 +1067,13 @@ class TagFexNet(nn.Module):
         self.args = args
 
         self._device = args["device"][0]
-        self.ta_net = get_convnet(args).to(self._device)
+        self.ta_net = get_convnet(args).to(self._device)  # Task-agnostic Model (fta)
 
         if hasattr(self.ta_net, 'fc'):
             self.ta_net.fc = None
-        self.ts_attn = None
-        self.trans_classifier = None
-
+        self.ts_attn = None  # Merge Attention 模块
+        self.trans_classifier = None  # 融合特征分类器，用于计算图中的 L_mcls
+        #将 TA 特征映射到高维空间，用于计算 L_ta
         self.projector = nn.Sequential(
             TagFex_SimpleLinear(self.ta_feature_dim, self.args["proj_hidden_dim"]),
             nn.ReLU(True),
