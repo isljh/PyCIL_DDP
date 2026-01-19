@@ -1,4 +1,5 @@
 import numpy as np
+import torch
 from torchvision import datasets, transforms
 from utils.toolkit import split_images_labels
 from . import autoaugment
@@ -178,7 +179,51 @@ class iImageNet100_AA(iImageNet100):
     # common_trsf 会处理 Normalize (均值和方差)
     # class_order 记得改为 np.arange(100).tolist()
 
+class MultiViewTransform:
+    def __init__(self, size_global=224, size_local=98):
+        # 基础增强算子（参考官方参数）
+        self.common_ops = [
+            transforms.RandomHorizontalFlip(p=0.5),
+            transforms.RandomApply([transforms.ColorJitter(0.4, 0.4, 0.2, 0.1)], p=0.8),
+            transforms.RandomGrayscale(p=0.2),
+            transforms.RandomApply([transforms.GaussianBlur(kernel_size=23, sigma=(0.1, 2.0))], p=0.5),
+            transforms.RandomApply([transforms.RandomSolarize(threshold=128)], p=0.2),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225))
+        ]
 
+        # 全局：30%-100% 裁剪
+        self.global_transform = transforms.Compose([
+            transforms.RandomResizedCrop(size_global, scale=(0.3, 1.0)),
+            *self.common_ops
+        ])
+
+        # 局部：5%-30% 裁剪，并 Resize 回 224 以便拼接
+        self.local_transform = transforms.Compose([
+            transforms.RandomResizedCrop(size_local, scale=(0.05, 0.3)),
+            transforms.Resize(size_global),
+            *self.common_ops
+        ])
+
+    def __call__(self, img):
+        views = []
+        # 2 个全局视图
+        for _ in range(2):
+            views.append(self.global_transform(img))
+        # 6 个局部视图
+        for _ in range(6):
+            views.append(self.local_transform(img))
+        # 拼接成 [8, 3, 224, 224]
+        return torch.stack(views)
+
+# 在你的 data.py 类里应用它
+class iImageNet100_LeJEPA(iImageNet100):
+    use_path = True
+    # 覆盖原有的 train_trsf
+    train_trsf = [MultiViewTransform(size_global=224, size_local=98)]
+    common_trsf = []
+
+'''   
 class iImageNet100_LeJEPA(iImageNet100):
     use_path = True
     train_trsf = [
@@ -201,3 +246,4 @@ class iImageNet100_LeJEPA(iImageNet100):
             transforms.RandomSolarize(threshold=128)
         ], p=0.2),
     ]
+'''

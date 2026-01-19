@@ -12,10 +12,11 @@ from utils.inc_net import TagFexNet
 from utils.toolkit import count_parameters, tensor2numpy
 from torchvision import transforms
 from torchvision.transforms.functional import to_pil_image
+import swanlab
 
 EPSILON = 1e-8
 
-init_epoch = 600
+init_epoch = 100
 init_lr = 0.1
 init_milestones = [60, 120, 170]
 init_lr_decay = 0.1
@@ -28,7 +29,7 @@ milestones = [80, 120, 150]
 lrate_decay = 0.1
 batch_size = 128
 weight_decay = 2e-4
-num_workers = 8
+num_workers = 16
 T = 2
 
 
@@ -99,6 +100,17 @@ class TagFex(BaseLearner):
 
         local_rank = self.args.get("local_rank", 0)
         is_distributed = self.args.get("is_distributed", False)
+
+        # --- SwanLab 初始化 ---
+        if local_rank <= 0:
+            # 每个任务开始时，初始化或更新实验记录
+            swanlab.init(
+                project="PyCIL_TagFex",
+                experiment_name=f"Task_{self._cur_task}",
+                config=self.args,  # 自动记录所有传入的 args
+                suffix="timestamp"  # 防止重名
+            )
+        # ---------------------
 
         # --- 新增：自动计算每个 GPU 的 batch_size ---
         if is_distributed:
@@ -203,35 +215,40 @@ class TagFex(BaseLearner):
             ptr = self._network.module if hasattr(self._network, 'module') else self._network
             ptr.weight_align(self._total_classes - self._known_classes)
 
+    def denormalize(self, tensor):
+        mean = torch.tensor([0.485, 0.456, 0.406]).to(tensor.device).view(3, 1, 1)
+        std = torch.tensor([0.229, 0.224, 0.225]).to(tensor.device).view(3, 1, 1)
+        return tensor * std + mean
+
     def _init_train(self, train_loader, test_loader, optimizer, scheduler):
         local_rank = self.args.get("local_rank", 0)
         disable_tqdm = (local_rank > 0)
-        prog_bar = tqdm(range(init_epoch), disable=disable_tqdm)
+        custom_init_epoch = 100
+        prog_bar = tqdm(range(custom_init_epoch), disable=disable_tqdm)
 
         # --- 1. 重新配置符合 LeJEPA 要求的优化器与调度器 ---
-        # 官方建议：主网络与分类头使用不同的超参数
         # 判断是否被 DDP 包装
         if hasattr(self._network, "module"):
             base_model = self._network.module
         else:
             base_model = self._network
-
+        base_lr = 5e-4
         params = [
-            {"params": base_model.convnets.parameters(), "lr": 2e-3, "weight_decay": 5e-2},
+            {"params": base_model.convnets.parameters(), "lr": base_lr, "weight_decay": 5e-4},
             {"params": base_model.fc.parameters(), "lr": 1e-3, "weight_decay": 1e-7}
         ]
         optimizer = torch.optim.AdamW(params)
 
         # 官方要求：必须包含 1 个 Epoch 的线性 Warmup
         warmup_steps = len(train_loader)
-        total_steps = len(train_loader) * init_epoch
+        total_steps = len(train_loader) * custom_init_epoch
         s1 = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=0.01, total_iters=warmup_steps)
-        s2 = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_steps - warmup_steps, eta_min=1e-3)
+        s2 = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_steps - warmup_steps, eta_min=base_lr/1000)
         scheduler = torch.optim.lr_scheduler.SequentialLR(optimizer, schedulers=[s1, s2], milestones=[warmup_steps])
 
-        V = self.args.get('num_views', 4)
-        lamb = self.args.get('lejepa_lambda', 0.02)
-
+        V_dim = self.args.get('num_views', 8)
+        lamb = self.args.get('lejepa_lambda', 0.05)
+        '''
         # 1. 组合随机增强逻辑 (不含 ToTensor)
         raw_trsf = train_loader.dataset.trsf
         if isinstance(raw_trsf, transforms.Compose):
@@ -250,6 +267,7 @@ class TagFex(BaseLearner):
             transforms.ToTensor(),
             transforms.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225))
         ])
+        '''
         for _, epoch in enumerate(prog_bar):
             if train_loader.sampler is not None:
                 train_loader.sampler.set_epoch(epoch)
@@ -257,18 +275,15 @@ class TagFex(BaseLearner):
             self.train()
             losses, correct, total = 0.0, 0, 0
             for i, data in enumerate(train_loader):
+                '''
                 inputs = data[1].to(self._device)
                 targets = data[-1].to(self._device)
                 # --- 防御性检查 ---
-                # 如果这里报错，说明数据源头就错了
                 # --- 调试打印 (仅在第一轮运行, 确认后可删除) ---
                 if i == 0 and epoch == 0 and local_rank <= 0:
                     logging.info(f"DEBUG: inputs shape {inputs.shape}, targets shape {targets.shape}")
                 # --- [防御性检查] ---
-                # 直接对比 targets 和 inputs 的第一维度，它们必须相等
                 if targets.numel() != inputs.shape[0]:
-                    # 如果还是报错，说明你的 Dataset 返回格式是 (index, data, something_else, target)
-                    # 尝试用 targets = data[-1].to(self._device)
                     targets = data[-1].to(self._device)
                     if targets.numel() != inputs.shape[0]:
                         raise ValueError(f"CRITICAL: Target mapping failed. Data elements: {len(data)}")
@@ -282,6 +297,23 @@ class TagFex(BaseLearner):
 
                 vs = torch.stack(multi_views, dim=1).to(self._device)  # [N, V, 3, 224, 224]
                 N, V_dim = vs.shape[0], vs.shape[1]
+                '''
+                vs = data[1].to(self._device)
+                targets = data[-1].to(self._device)
+                N = vs.shape[0]
+
+                # --- [可视化] ---
+                if i == 0 and epoch % 10 == 0 and local_rank <= 0:
+                    # 取第 0 个样本的所有视图：vs[0] -> [8, 3, 224, 224]
+                    sample_8_views = vs[0].cpu()
+                    swan_images = []
+                    for idx in range(V_dim):
+                        # 加入 denormalize 还原颜色（函数需定义在外部或类内）
+                        raw_img = torch.clamp(self.denormalize(sample_8_views[idx]), 0, 1)
+                        label = "Global" if idx < 2 else "Local"
+                        swan_images.append(swanlab.Image(to_pil_image(raw_img), caption=f"{label}_{idx}"))
+                    swanlab.log({"Visual/8_Views_Check": swan_images})
+
 
                 # --- [前向传播] ---
                 out = self._network(vs.flatten(0, 1))
@@ -308,15 +340,32 @@ class TagFex(BaseLearner):
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
+                scheduler.step()
 
                 losses += loss.item()
                 _, preds = torch.max(logits, dim=1)
                 correct += preds.eq(y_rep).sum().item()
                 total += y_rep.size(0)  # 统计总预测数 (N*V)
 
-            scheduler.step()
+
             if not disable_tqdm:
                 train_acc = np.around(correct * 100 / total, decimals=2)
+
+                avg_loss = losses / len(train_loader)
+                # --- SwanLab 记录 Init 阶段指标 ---
+                if local_rank <= 0:
+                    swanlab.log({
+                        "init/total_loss": avg_loss,
+                        "init/train_acc": train_acc,
+                        "init/Prediction_Invariance_loss": inv_loss.item(),
+                        "init/SIGReg_loss": sigreg_loss.item(),
+                        "init/LeJEPA_total_loss": lejepa_loss.item(),
+                        "init/ce_loss": ce_loss.item(),
+                        "init/lr": optimizer.param_groups[0]['lr'],
+                        "epoch": epoch
+                    })
+                # -------------------------------
+
                 prog_bar.set_description(
                     f"Task {self._cur_task}, Epoch {epoch + 1}/{init_epoch} Loss {losses / len(train_loader):.3f}, Acc {train_acc:.2f}")
 
@@ -391,6 +440,20 @@ class TagFex(BaseLearner):
             scheduler.step()
             if not disable_tqdm:
                 train_acc = np.around(tensor2numpy(correct) * 100 / total, decimals=2)
+
+                avg_loss = losses / len(train_loader)
+                # --- SwanLab 记录 Update 阶段指标 ---
+                if local_rank <= 0:
+                    swanlab.log({
+                        "update/total_loss": avg_loss,
+                        "update/train_acc": train_acc,
+                        "update/clf_loss": loss_clf.item(),
+                        "update/kd_loss": kd_loss.item() if isinstance(kd_loss, torch.Tensor) else kd_loss,
+                        "update/infonce_loss": infonce_loss.item(),
+                        "epoch": epoch
+                    })
+                # -------------------------------
+
                 prog_bar.set_description(
                     f"Task {self._cur_task} Epoch {epoch + 1}/{epochs} Loss {losses / len(train_loader):.3f} Acc {train_acc:.2f}")
 

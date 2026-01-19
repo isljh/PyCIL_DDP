@@ -4,7 +4,7 @@ import os
 import torch
 import torch.distributed as dist
 from trainer import train
-
+import swanlab
 
 def main():
     # 1. 初始化分布式环境
