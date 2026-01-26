@@ -130,8 +130,29 @@ class BaseLearner(object):
     def _extract_vectors(self, loader):
         self._network.eval()
         vectors, targets = [], []
+
+        #  PIL -> Tensor
+        from torchvision import transforms
+        pilot_trsf = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        ])
+
         for _, _inputs, _targets in loader:
             _targets = _targets.numpy()
+
+            # --- 新增逻辑：处理 PIL 图片 ---
+            # 如果 _inputs 还是 PIL 图片（或者图片列表），手动转换成 Tensor
+            if not isinstance(_inputs, torch.Tensor):
+                if isinstance(_inputs, (list, tuple)):
+                    # 如果是列表，循环转换并 stack
+                    _inputs = torch.stack(
+                        [pilot_trsf(img) if not isinstance(img, torch.Tensor) else img for img in _inputs])
+                else:
+                    # 如果是单个 PIL 对象
+                    _inputs = pilot_trsf(_inputs).unsqueeze(0)
+                    # ----------------------------
+
             network = self._network.module if isinstance(self._network, (nn.DataParallel, nn.parallel.DistributedDataParallel)) else self._network
             _vectors = tensor2numpy(
                 network.extract_vector(_inputs.to(self._device))

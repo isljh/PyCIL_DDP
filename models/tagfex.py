@@ -27,7 +27,7 @@ epochs = 170
 lrate = 0.1
 milestones = [80, 120, 150]
 lrate_decay = 0.1
-batch_size = 128
+batch_size = 256
 weight_decay = 2e-4
 num_workers = 16
 T = 2
@@ -76,7 +76,18 @@ class TagFex(BaseLearner):
     def __init__(self, args):
         super().__init__(args)
         self._network = TagFexNet(args, False)
-        # --- 新增：实例化 SIGReg ---
+        """
+        {
+            'ta_feature': ta_feature,                      ta分支得到的特征
+            'embedding': embedding,                        自监督嵌入,ta分支得到的特征经过projector得到的嵌入
+            'trans_logits': trans_logits,                  融合后的特征进行分类
+            'predicted_feature': predicted_feature,        服务于 知识蒸馏,根据当前的 ta_feature 去“预测”旧模型提取出来的特征
+            'features': features                           所有任务特定专家提取特征的总和
+            'logits': logits                               合并特征分类
+            'aux_logits':aux_logits                        辅助分支分类（新旧类别）
+        }
+        """
+        # --- 实例化 SIGReg ---
         self.sig_reg = SIGReg(knots=17)
 
     def after_task(self):
@@ -223,8 +234,8 @@ class TagFex(BaseLearner):
     def _init_train(self, train_loader, test_loader, optimizer, scheduler):
         local_rank = self.args.get("local_rank", 0)
         disable_tqdm = (local_rank > 0)
-        custom_init_epoch = 100
-        prog_bar = tqdm(range(custom_init_epoch), disable=disable_tqdm)
+        #custom_init_epoch = 100
+        prog_bar = tqdm(range(init_epoch), disable=disable_tqdm)
 
         # --- 1. 重新配置符合 LeJEPA 要求的优化器与调度器 ---
         # 判断是否被 DDP 包装
@@ -235,69 +246,34 @@ class TagFex(BaseLearner):
         base_lr = 5e-4
         params = [
             {"params": base_model.convnets.parameters(), "lr": base_lr, "weight_decay": 5e-4},
-            {"params": base_model.fc.parameters(), "lr": 1e-3, "weight_decay": 1e-7}
+            {"params": base_model.fc.parameters(), "lr": 1e-3, "weight_decay": 1e-7},
+            {"params": base_model.ta_net.parameters(), "lr": base_lr, "weight_decay": 5e-4},
+            {"params": base_model.projector.parameters(), "lr": base_lr, "weight_decay": 5e-4}
         ]
+
+        if base_model.aux_fc is not None:
+            params.append({"params": base_model.aux_fc.parameters(), "lr": 1e-3})
+
         optimizer = torch.optim.AdamW(params)
 
         # 官方要求：必须包含 1 个 Epoch 的线性 Warmup
         warmup_steps = len(train_loader)
-        total_steps = len(train_loader) * custom_init_epoch
+        total_steps = len(train_loader) * init_epoch
         s1 = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=0.01, total_iters=warmup_steps)
         s2 = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_steps - warmup_steps, eta_min=base_lr/1000)
         scheduler = torch.optim.lr_scheduler.SequentialLR(optimizer, schedulers=[s1, s2], milestones=[warmup_steps])
 
         V_dim = self.args.get('num_views', 8)
         lamb = self.args.get('lejepa_lambda', 0.05)
-        '''
-        # 1. 组合随机增强逻辑 (不含 ToTensor)
-        raw_trsf = train_loader.dataset.trsf
-        if isinstance(raw_trsf, transforms.Compose):
-            trsf_list = raw_trsf.transforms
-        else:
-            trsf_list = raw_trsf
 
-        # 过滤掉 Tensor 相关的算子
-        clean_trsf_list = [
-            t for t in trsf_list
-            if not isinstance(t, (transforms.ToTensor, transforms.Normalize))
-        ]
-        train_trsf = transforms.Compose(clean_trsf_list)
-        # 2. 组合标准化逻辑 (ToTensor + Normalize)
-        common_trsf = transforms.Compose([
-            transforms.ToTensor(),
-            transforms.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225))
-        ])
-        '''
         for _, epoch in enumerate(prog_bar):
             if train_loader.sampler is not None:
-                train_loader.sampler.set_epoch(epoch)
+                if isinstance(train_loader.sampler, torch.utils.data.distributed.DistributedSampler):
+                    train_loader.sampler.set_epoch(epoch)
 
             self.train()
             losses, correct, total = 0.0, 0, 0
             for i, data in enumerate(train_loader):
-                '''
-                inputs = data[1].to(self._device)
-                targets = data[-1].to(self._device)
-                # --- 防御性检查 ---
-                # --- 调试打印 (仅在第一轮运行, 确认后可删除) ---
-                if i == 0 and epoch == 0 and local_rank <= 0:
-                    logging.info(f"DEBUG: inputs shape {inputs.shape}, targets shape {targets.shape}")
-                # --- [防御性检查] ---
-                if targets.numel() != inputs.shape[0]:
-                    targets = data[-1].to(self._device)
-                    if targets.numel() != inputs.shape[0]:
-                        raise ValueError(f"CRITICAL: Target mapping failed. Data elements: {len(data)}")
-                # --- [核心：生成 V 个视图] ---
-                multi_views = []
-                pil_list = [to_pil_image(img.cpu()) for img in inputs]
-                for _ in range(V):
-                    # 对 Batch 里的每张图独立应用随机增强
-                    view = torch.stack([common_trsf(train_trsf(p_img)) for p_img in pil_list])
-                    multi_views.append(view)
-
-                vs = torch.stack(multi_views, dim=1).to(self._device)  # [N, V, 3, 224, 224]
-                N, V_dim = vs.shape[0], vs.shape[1]
-                '''
                 vs = data[1].to(self._device)
                 targets = data[-1].to(self._device)
                 N = vs.shape[0]
@@ -308,7 +284,7 @@ class TagFex(BaseLearner):
                     sample_8_views = vs[0].cpu()
                     swan_images = []
                     for idx in range(V_dim):
-                        # 加入 denormalize 还原颜色（函数需定义在外部或类内）
+                        # 加入 denormalize 还原颜色
                         raw_img = torch.clamp(self.denormalize(sample_8_views[idx]), 0, 1)
                         label = "Global" if idx < 2 else "Local"
                         swan_images.append(swanlab.Image(to_pil_image(raw_img), caption=f"{label}_{idx}"))
@@ -342,15 +318,35 @@ class TagFex(BaseLearner):
                 optimizer.step()
                 scheduler.step()
 
-                losses += loss.item()
+
                 _, preds = torch.max(logits, dim=1)
-                correct += preds.eq(y_rep).sum().item()
-                total += y_rep.size(0)  # 统计总预测数 (N*V)
+                batch_correct = preds.eq(y_rep).sum().item()
+                batch_total = y_rep.size(0)
+                batch_acc = (batch_correct * 100 / batch_total)
+
+                # --- [核心修改：每个 Batch 记录一次数据] ---
+                if local_rank <= 0:
+                    # SwanLab 默认会自动累计 step，直接 log 即可。
+                    # 如果你想跨 Task 保持步数连续，可以传入 step=self.global_step
+                    swanlab.log({
+                        "init/total_loss": loss.item(),
+                        "init/batch_acc": batch_acc,
+                        "init/Prediction_Invariance_loss": inv_loss.item(),
+                        "init/SIGReg_loss": sigreg_loss.item(),
+                        "init/LeJEPA_total_loss": lejepa_loss.item(),
+                        "init/ce_loss": ce_loss.item(),
+                        "init/lr": optimizer.param_groups[0]['lr'],
+                    })
+
+                losses += loss.item()
+                correct += batch_correct
+                total += batch_total  # 统计总预测数 (N*V)
+
 
 
             if not disable_tqdm:
                 train_acc = np.around(correct * 100 / total, decimals=2)
-
+                '''
                 avg_loss = losses / len(train_loader)
                 # --- SwanLab 记录 Init 阶段指标 ---
                 if local_rank <= 0:
@@ -365,7 +361,7 @@ class TagFex(BaseLearner):
                         "epoch": epoch
                     })
                 # -------------------------------
-
+                '''
                 prog_bar.set_description(
                     f"Task {self._cur_task}, Epoch {epoch + 1}/{init_epoch} Loss {losses / len(train_loader):.3f}, Acc {train_acc:.2f}")
 

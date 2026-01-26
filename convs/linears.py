@@ -68,6 +68,13 @@ class TagFex_SimpleLinear(nn.Module):
 
 class CosineLinear(nn.Module):
     def __init__(self, in_features, out_features, nb_proxy=1, to_reduce=False, sigma=True):
+        """
+        余弦线性分类层
+        Args:
+            nb_proxy (int): 代理数量，即每个类拥有的“特征中心”个数。默认 1。若为 3，则每个类有 3 个权重向量，用于处理类内多样性。
+            to_reduce (bool): 是否合并多个代理的分数。
+            sigma (bool): 是否使用可学习的缩放因子。
+        """
         super(CosineLinear, self).__init__()
         self.in_features = in_features
         self.out_features = out_features * nb_proxy

@@ -22,6 +22,7 @@ class DataManager(object):
             self._increments.append(offset)
 
     @property
+    # Number of Tasks
     def nb_tasks(self):
         return len(self._increments)
 
@@ -35,6 +36,7 @@ class DataManager(object):
         return len(self._class_order)
 
     def get_dataset(
+        # appendent: 一个包含旧知识的元组 (old_data, old_targets)
         self, indices, source, mode, appendent=None, ret_data=False, m_rate=None
     ):
         if source == "train":
@@ -82,6 +84,7 @@ class DataManager(object):
         if ret_data:
             return data, targets, DummyDataset(data, targets, trsf, self.use_path,self.aug if source == "train" and mode == "train" else 1)
         else:
+            #---------------------self.aug没用了--------------------------------------------
             return DummyDataset(data, targets, trsf, self.use_path,self.aug if source == "train" and mode == "train" else 1)
 
         

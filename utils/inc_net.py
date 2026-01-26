@@ -16,6 +16,7 @@ from convs.memo_cifar_resnet import get_resnet32_a2fc as get_memo_resnet32 #for 
 from convs.ACL_buffer import RandomBuffer, activation_t
 from convs.linears import RecursiveLinear
 from typing import Dict, Any
+from torchvision.ops import MLP
 
 
 def get_convnet(args, pretrained=False):
@@ -1076,21 +1077,28 @@ class TagFexNet(nn.Module):
         #将 TA 特征映射到高维空间，用于计算 L_ta
         self.projector = nn.Sequential(
             TagFex_SimpleLinear(self.ta_feature_dim, self.args["proj_hidden_dim"]),
-            nn.ReLU(True),
+            nn.BatchNorm1d(self.args["proj_hidden_dim"]),
+            #nn.ReLU(True),
             TagFex_SimpleLinear(self.args["proj_hidden_dim"], self.args["proj_output_dim"]),
+            nn.BatchNorm1d(self.args["proj_output_dim"])
         ).to(self._device)
+        #-----------------------------------------------------------------------
+        #self.proj = MLP(512, [2048, 2048, 16], norm_layer=nn.BatchNorm1d)
+        #---------------------------------------------------------------------------
         self.predictor = None
 
     @property
     def ta_feature_dim(self):
-        return self.ta_net.out_dim
-    
+        return self.ta_net.out_dim #512
+
+    #计算fs最后拼接完的特征长度
     @property
     def feature_dim(self):
         if self.out_dim is None:
             return 0
         return self.out_dim * len(self.convnets)
 
+    #拼接特征
     def extract_vector(self, x):
         features = [convnet(x)["features"] for convnet in self.convnets]
         features = torch.cat(features, 1)
@@ -1109,8 +1117,8 @@ class TagFexNet(nn.Module):
 
         out.update({"aux_logits": aux_logits, "features": features})
         
-        ta_fmap = self.ta_net(x)['fmaps'][-1] # (bs, C, H, W)
-        ta_feature = ta_fmap.flatten(2).permute(0, 2, 1).mean(1) # (bs, H*W, C) -mean-> (bs, C)
+        ta_fmap = self.ta_net(x)['fmaps'][-1] # (bs, C, H, W)  [bs, 512, 4, 4]
+        ta_feature = ta_fmap.flatten(2).permute(0, 2, 1).mean(1) # (bs, H*W, C) -mean-> (bs, C)  (bs, 512)
         #print(ta_feature)
         #assert 0
         embedding = self.projector(ta_feature)
@@ -1134,13 +1142,13 @@ class TagFexNet(nn.Module):
         return out
         """
         {
-            'ta_feature': ta_feature,
-            'embedding': embedding,
-            'trans_logits': trans_logits,
-            'predicted_feature': predicted_feature,
-            'features': features
-            'logits': logits
-            'aux_logits':aux_logits
+            'ta_feature': ta_feature,                      ta分支得到的特征
+            'embedding': embedding,                        自监督嵌入,ta分支得到的特征经过projector得到的嵌入
+            'trans_logits': trans_logits,                  融合后的特征进行分类
+            'predicted_feature': predicted_feature,        服务于 知识蒸馏,根据当前的 ta_feature 去“预测”旧模型提取出来的特征
+            'features': features                           所有任务特定专家提取特征的总和
+            'logits': logits                               合并特征分类
+            'aux_logits':aux_logits                        辅助分支分类（新旧类别）
         }
         """
      
@@ -1149,6 +1157,7 @@ class TagFexNet(nn.Module):
             self.convnets.append(get_convnet(self.args).to(self._device))
         else:
             self.convnets.append(get_convnet(self.args).to(self._device))
+            #init_interpolation_factor:初始插值系数
             init_interpolation_factor = self.args["init_interpolation_factor"]
             for ts_old_parameter, ts_new_parameter, ta_prarameter in zip(self.convnets[-2].parameters(), self.convnets[-1].parameters(), self.ta_net.parameters()):
                 ts_new_parameter.data = init_interpolation_factor * ts_old_parameter.data + (1 - init_interpolation_factor) * ta_prarameter.data
