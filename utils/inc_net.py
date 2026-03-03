@@ -1078,9 +1078,12 @@ class TagFexNet(nn.Module):
         self.projector = nn.Sequential(
             TagFex_SimpleLinear(self.ta_feature_dim, self.args["proj_hidden_dim"]),
             nn.BatchNorm1d(self.args["proj_hidden_dim"]),
-            #nn.ReLU(True),
+            nn.ReLU(True),
+            TagFex_SimpleLinear(self.args["proj_hidden_dim"], self.args["proj_hidden_dim"]),
+            nn.BatchNorm1d(self.args["proj_hidden_dim"]),
+            nn.ReLU(True),
             TagFex_SimpleLinear(self.args["proj_hidden_dim"], self.args["proj_output_dim"]),
-            nn.BatchNorm1d(self.args["proj_output_dim"])
+            nn.BatchNorm1d(self.args["proj_output_dim"]),
         ).to(self._device)
         #-----------------------------------------------------------------------
         #self.proj = MLP(512, [2048, 2048, 16], norm_layer=nn.BatchNorm1d)

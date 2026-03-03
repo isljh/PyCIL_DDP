@@ -4,7 +4,6 @@ import os
 import torch
 import torch.distributed as dist
 from trainer import train
-import swanlab
 
 def main():
     # 1. 初始化分布式环境
@@ -22,8 +21,8 @@ def main():
         # 非 DDP 模式保留原逻辑或默认 0
         device_id = 0
 
-    args = setup_parser().parse_args()
-    param = load_json(args.config)
+    args = setup_parser().parse_args()   # 拿命令行里的参数
+    param = load_json(args.config)     # 拿 JSON 文件里的参数
     args_dict = vars(args)
 
     # 2. 合并参数

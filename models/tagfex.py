@@ -13,31 +13,29 @@ from utils.toolkit import count_parameters, tensor2numpy
 from torchvision import transforms
 from torchvision.transforms.functional import to_pil_image
 import swanlab
+import torch.distributed as dist
 
 EPSILON = 1e-8
 
-init_epoch = 100
-init_lr = 0.1
-init_milestones = [60, 120, 170]
-init_lr_decay = 0.1
-init_weight_decay = 0.0005
-momentum = 0.9
+init_epoch = 200
+init_lr = 5e-4
+#init_milestones = [60, 120, 170]
+#init_lr_decay = 0.1
+init_weight_decay = 5e-4
+#momentum = 0.9
 
 epochs = 170
-lrate = 0.1
-milestones = [80, 120, 150]
-lrate_decay = 0.1
-batch_size = 256
-weight_decay = 2e-4
+update_lr = 5e-4
+#milestones = [80, 120, 150]
+#lrate_decay = 0.1
+batch_size = 128
+weight_decay = 5e-4
 num_workers = 16
 T = 2
 
 
 class SIGReg(nn.Module):
-    """
-    LeJEPA 的核心组件：Sketched Isotropic Gaussian Regularization (SIGReg)
-    该损失函数确保 learned embeddings 符合标准正态分布，从而最小化下游风险。
-    """
+
 
     def __init__(self, knots=17):
         super().__init__()
@@ -71,7 +69,40 @@ class SIGReg(nn.Module):
         # 3. 计算统计量
         statistic = (err @ weights) * proj.size(-2)
         return statistic.mean()
+"""
 
+
+class SIGReg(nn.Module):
+    def __init__(self, in_dim=1024, proj_dim=256, knots=17):
+        super().__init__()
+        t = torch.linspace(0, 3, knots, dtype=torch.float32)
+        dt = 3 / (knots - 1)
+        weights = torch.full((knots,), 2 * dt, dtype=torch.float32)
+        weights[[0, -1]] = dt
+        window = torch.exp(-t.square() / 2.0)
+
+        self.register_buffer("t", t)
+        self.register_buffer("phi", window)
+        self.register_buffer("weights", weights * window)
+
+        # ✅ 固定投影矩阵，不再随 batch 随机生成
+        A = torch.randn(in_dim, proj_dim)
+        A = A.div_(A.norm(p=2, dim=0))
+        self.register_buffer("projection_A", A)
+
+    def forward(self, proj):
+        # 如果输入的 dim 变了（比如从 1024 变 512），自动重新适配，防止报错
+        if proj.size(-1) != self.projection_A.size(0):
+            device = proj.device
+            new_A = torch.randn(proj.size(-1), 256, device=device)
+            new_A = new_A.div_(new_A.norm(p=2, dim=0))
+            self.projection_A = new_A  # 临时更新
+
+        x_t = (proj @ self.projection_A).unsqueeze(-1) * self.t
+        err = (x_t.cos().mean(-3) - self.phi).square() + x_t.sin().mean(-3).square()
+        statistic = (err @ self.weights) * proj.size(-2)
+        return statistic.mean()
+"""
 class TagFex(BaseLearner):
     def __init__(self, args):
         super().__init__(args)
@@ -89,6 +120,18 @@ class TagFex(BaseLearner):
         """
         # --- 实例化 SIGReg ---
         self.sig_reg = SIGReg(knots=17)
+
+        # --- SwanLab 初始化 ---
+        local_rank = self.args.get("local_rank", 0)
+        if local_rank <= 0:
+            # 每个任务开始时，初始化或更新实验记录
+            swanlab.init(
+                project="PyCIL_TagFex",
+                experiment_name=f"TagFex",
+                config=self.args,  # 自动记录所有传入的 args
+                suffix="timestamp"  # 防止重名
+            )
+        # ---------------------
 
     def after_task(self):
         self._known_classes = self._total_classes
@@ -111,7 +154,7 @@ class TagFex(BaseLearner):
 
         local_rank = self.args.get("local_rank", 0)
         is_distributed = self.args.get("is_distributed", False)
-
+        """
         # --- SwanLab 初始化 ---
         if local_rank <= 0:
             # 每个任务开始时，初始化或更新实验记录
@@ -122,7 +165,7 @@ class TagFex(BaseLearner):
                 suffix="timestamp"  # 防止重名
             )
         # ---------------------
-
+        """
         # --- 新增：自动计算每个 GPU 的 batch_size ---
         if is_distributed:
             import torch.distributed as dist
@@ -167,12 +210,12 @@ class TagFex(BaseLearner):
         self.train_loader = DataLoader(
             train_dataset, batch_size=current_batch_size,
             shuffle=(train_sampler is None), num_workers=num_workers,
-            pin_memory=True, sampler=train_sampler
+            pin_memory=True, sampler=train_sampler,drop_last=True
         )
 
         test_dataset = data_manager.get_dataset(np.arange(0, self._total_classes), source="test", mode="test")
         self.test_loader = DataLoader(
-            test_dataset, batch_size=current_batch_size, shuffle=False, num_workers=num_workers, pin_memory=True
+            test_dataset, batch_size=current_batch_size, shuffle=False, num_workers=num_workers, pin_memory=True,drop_last=False
         )
 
         # 包装 DDP (仅当尚未包装时)
@@ -208,23 +251,39 @@ class TagFex(BaseLearner):
 
     def _train(self, train_loader, test_loader):
         self._network.to(self._device)
+        self.sig_reg.to(self._device)
+
         torch.backends.cudnn.benchmark = True
 
         # 过滤需要梯度的参数
         trainable_params = filter(lambda p: p.requires_grad, self._network.parameters())
 
         if self._cur_task == 0:
-            optimizer = optim.SGD(trainable_params, momentum=0.9, lr=init_lr, weight_decay=init_weight_decay)
-            scheduler = optim.lr_scheduler.MultiStepLR(optimizer, milestones=init_milestones, gamma=init_lr_decay)
+            optimizer = torch.optim.AdamW(trainable_params,  lr=init_lr, weight_decay=init_weight_decay)
+            # 使用包含 Warmup 的调度器（LeJEPA 官方推荐）
+            warmup_steps = len(train_loader)
+            total_steps = len(train_loader) * init_epoch
+            s1 = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=0.01, total_iters=warmup_steps)
+            s2 = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_steps - warmup_steps,
+                                                            eta_min=init_lr / 1000)
+            scheduler = torch.optim.lr_scheduler.SequentialLR(optimizer, schedulers=[s1, s2], milestones=[warmup_steps])
             self._init_train(train_loader, test_loader, optimizer, scheduler)
         else:
-            optimizer = optim.SGD(trainable_params, lr=lrate, momentum=0.9, weight_decay=weight_decay)
-            scheduler = optim.lr_scheduler.MultiStepLR(optimizer, milestones=milestones, gamma=lrate_decay)
+            torch.cuda.empty_cache()
+            trainable_params = filter(lambda p: p.requires_grad, self._network.parameters())
+            optimizer = torch.optim.AdamW(trainable_params, lr=update_lr, weight_decay=weight_decay)
+            warmup_steps = len(train_loader)
+            total_steps = len(train_loader) * epochs
+
+            s1 = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=0.01, total_iters=warmup_steps)
+            s2 = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_steps - warmup_steps, eta_min=1e-6)
+            scheduler = torch.optim.lr_scheduler.SequentialLR(optimizer, schedulers=[s1, s2], milestones=[warmup_steps])
             self._update_representation(train_loader, test_loader, optimizer, scheduler)
 
             # 权重对齐
             ptr = self._network.module if hasattr(self._network, 'module') else self._network
             ptr.weight_align(self._total_classes - self._known_classes)
+            torch.cuda.empty_cache()
 
     def denormalize(self, tensor):
         mean = torch.tensor([0.485, 0.456, 0.406]).to(tensor.device).view(3, 1, 1)
@@ -234,9 +293,8 @@ class TagFex(BaseLearner):
     def _init_train(self, train_loader, test_loader, optimizer, scheduler):
         local_rank = self.args.get("local_rank", 0)
         disable_tqdm = (local_rank > 0)
-        #custom_init_epoch = 100
         prog_bar = tqdm(range(init_epoch), disable=disable_tqdm)
-
+        """
         # --- 1. 重新配置符合 LeJEPA 要求的优化器与调度器 ---
         # 判断是否被 DDP 包装
         if hasattr(self._network, "module"):
@@ -262,9 +320,12 @@ class TagFex(BaseLearner):
         s1 = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=0.01, total_iters=warmup_steps)
         s2 = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_steps - warmup_steps, eta_min=base_lr/1000)
         scheduler = torch.optim.lr_scheduler.SequentialLR(optimizer, schedulers=[s1, s2], milestones=[warmup_steps])
-
+        """
         V_dim = self.args.get('num_views', 8)
         lamb = self.args.get('lejepa_lambda', 0.05)
+
+        # --- [关键：重置本阶段步数] ---
+        batch_step = 0
 
         for _, epoch in enumerate(prog_bar):
             if train_loader.sampler is not None:
@@ -336,7 +397,8 @@ class TagFex(BaseLearner):
                         "init/LeJEPA_total_loss": lejepa_loss.item(),
                         "init/ce_loss": ce_loss.item(),
                         "init/lr": optimizer.param_groups[0]['lr'],
-                    })
+                    }, step=batch_step)
+                    batch_step += 1
 
                 losses += loss.item()
                 correct += batch_correct
@@ -370,41 +432,70 @@ class TagFex(BaseLearner):
         disable_tqdm = (local_rank > 0)
         prog_bar = tqdm(range(epochs), disable=disable_tqdm)
 
+        V_dim = self.args.get('num_views', 8)
+        lamb = self.args.get('lejepa_lambda', 0.05)
+
+        task_prefix = f"Task_{self._cur_task}"
+        batch_step = 0
+
         for _, epoch in enumerate(prog_bar):
             if train_loader.sampler is not None:
                 train_loader.sampler.set_epoch(epoch)
 
             self.train()
             losses, losses_clf, losses_aux, correct, total = 0.0, 0.0, 0.0, 0, 0
-            for i, (_, inputs1, inputs2, targets) in enumerate(train_loader):
-                inputs1, inputs2, targets = inputs1.to(self._device), inputs2.to(self._device), targets.to(self._device)
-                inputs = torch.cat([inputs1, inputs2], dim=0)
-                targets = torch.cat([targets, targets], dim=0)
+            for i, data in enumerate(train_loader):
+                vs = data[1].to(self._device)  # [Batch, 8, 3, 224, 224]
+                targets = data[-1].to(self._device)  # [Batch]
+                N = vs.shape[0]
 
-                outputs = self._network(inputs)
+                outputs = self._network(vs.flatten(0, 1))
                 logits, aux_logits = outputs["logits"], outputs["aux_logits"]
                 embedding = outputs['embedding']
 
-                infonce_loss = infoNCE_loss(embedding, self.args['infonce_temp'])
-                loss_clf = F.cross_entropy(logits, targets)
+                # --- [LeJEPA 损失] ---
+                proj = embedding.reshape(N, V_dim, -1)
+                proj_mean = proj.mean(1, keepdim=True)
+                inv_loss = (proj_mean - proj).square().mean()
+                sigreg_loss = self.sig_reg(embedding)
+                lejepa_loss = sigreg_loss * lamb + inv_loss * (1 - lamb)
+
+                # --- [分类与增量损失] ---
+                y_rep = targets.repeat_interleave(V_dim)
+                loss_clf = F.cross_entropy(logits, y_rep)
 
                 # Aux Loss
-                aux_targets = targets.clone()
+                aux_targets = y_rep.clone()
                 aux_targets = torch.where(aux_targets - self._known_classes + 1 > 0,
                                           aux_targets - self._known_classes + 1, 0)
                 loss_aux = F.cross_entropy(aux_logits, aux_targets)
 
                 # Distill Loss
-                predicted_feature = outputs['predicted_feature']
-                old_ta_feature = self.last_ta_net(inputs.contiguous())['features']
+                predicted_feature = outputs['predicted_feature'] # [N*V, Dim]
+                """
+                with torch.no_grad():
+                    old_ta_feature = self.last_ta_net(vs.flatten(0, 1))['features']
                 kd_loss = infoNCE_distill_loss(self.last_projector(predicted_feature),
                                                self.last_projector(old_ta_feature), self.args['infonce_kd_temp'])
+                """
+                # 找到这一行并确保投影层的一致性
+                with torch.no_grad():
+                    old_out = self.last_ta_net(vs.flatten(0, 1))
+                    old_ta_feature = old_out['features']
+                    # 建议：如果 last_projector 也是旧的，确保它是 frozen 状态
+                    z_target = self.last_projector(old_ta_feature)
+
+                p_pred = self.last_projector(predicted_feature)
+
+                # 调用修正后的函数
+                kd_loss = infoNCE_distill_loss(p_pred, z_target, self.args['infonce_kd_temp'])
 
                 # Transfer Loss
                 trans_logits = outputs["trans_logits"]
-                cur_task_mask = (targets >= self._known_classes)
-                trans_cls_loss = F.cross_entropy(trans_logits[cur_task_mask],
-                                                 targets[cur_task_mask] - self._known_classes)
+                cur_task_mask = (y_rep >= self._known_classes)
+                # trans_cls_loss = F.cross_entropy(trans_logits[cur_task_mask],targets[cur_task_mask] - self._known_classes)
+                y_rep_new = y_rep - self._known_classes  # 偏移标签
+                trans_cls_loss = F.cross_entropy(trans_logits[cur_task_mask], y_rep_new[cur_task_mask])
 
                 if trans_cls_loss < loss_clf:
                     temp_T = self.args['kd_temp']
@@ -417,7 +508,7 @@ class TagFex(BaseLearner):
                 auto_kd_factor = self._known_classes / self._total_classes
                 loss = loss_clf + \
                        self.args['aux_factor'] * loss_aux + \
-                       self.args['contrast_factor'] * (infonce_loss * (1 - auto_kd_factor) + self.args[
+                       self.args['contrast_factor'] * (lejepa_loss * (1 - auto_kd_factor) + self.args[
                     'contrast_kd_factor'] * kd_loss * auto_kd_factor) + \
                        self.args['trans_cls_factor'] * trans_cls_loss + \
                        self.args['transfer_factor'] * transfer_loss
@@ -425,30 +516,55 @@ class TagFex(BaseLearner):
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
+                scheduler.step()
 
                 losses += loss.item()
                 losses_aux += loss_aux.item()
                 losses_clf += loss_clf.item()
                 _, preds = torch.max(logits, dim=1)
-                correct += preds.eq(targets.expand_as(preds)).cpu().sum()
-                total += len(targets)
+                batch_acc = preds.eq(y_rep).sum().item() * 100.0 / y_rep.size(0)
+                correct += preds.eq(y_rep).cpu().sum()
+                total += len(y_rep)
+                # ==========================================================================================
+                # [Loss Functions Summary - TagFex with LeJEPA]
+                # 1. 核心分类 (Task-specific Classification):
+                #    - loss_clf: 主分类损失。约束 Backbone 提取具有判别性的特征以区分当前任务类别。
+                #    - loss_aux: 辅助分类损失 (DER)。将旧类视为整体，专注于提升新类别的特征提取质量。
+                #
+                # 2. LeJEPA 自监督 (Task-agnostic Representation):
+                #    - inv_loss (Invariance): 视图不变性损失。拉近同一样本不同增强视图间的距离，学习物体本质特征。
+                #    - sigreg_loss (Variance/Covariance): 正则项。防止特征空间坍缩，确保特征维度分布的独立性与多样性。
+                #    - lejepa_loss: 上述两者的加权组合，代表无监督表征学习的整体质量。
+                #
+                # 3. 知识保持与防遗忘 (Knowledge Preservation):
+                #    - kd_loss (InfoNCE Distillation): 特征级蒸馏。利用对比学习强制当前模型复现旧模型的特征布局。
+                #    - transfer_loss (KL Divergence): 逻辑对齐。当迁移分类器表现更好时，引导主分类器模仿其输出概率。
+                #
+                # 4. 特征迁移 (Feature Transfer):
+                #    - trans_cls_loss: 迁移分类损失。优化 Merge Attention 模块，使其能有效聚合任务无关与任务相关的特征。
+                #
+                # 5. 权重平衡 (Dynamic Balancing):
+                #    - auto_kd_factor: 动态因子 (已知类/总类)。任务前期侧重 LeJEPA 探索，任务后期侧重 KD 蒸馏以抑制遗忘。
+                # ==========================================================================================
+                if local_rank <= 0:
+                    swanlab.log({
+                        f"{task_prefix}/total_loss": loss.item(),
+                        f"{task_prefix}/train_acc": batch_acc,
+                        f"{task_prefix}/clf_loss": loss_clf.item(),
+                        f"{task_prefix}/kd_loss": kd_loss.item() if isinstance(kd_loss, torch.Tensor) else kd_loss,
+                        f"{task_prefix}/Prediction_Invariance_loss": inv_loss.item(),
+                        f"{task_prefix}/SIGReg_loss": sigreg_loss.item(),
+                        f"{task_prefix}/lejepa_loss": lejepa_loss.item(),
+                        f"{task_prefix}/epoch": epoch
+                    }, step=batch_step)
+                    batch_step += 1
+                # -------------------------------
 
-            scheduler.step()
+
             if not disable_tqdm:
                 train_acc = np.around(tensor2numpy(correct) * 100 / total, decimals=2)
 
                 avg_loss = losses / len(train_loader)
-                # --- SwanLab 记录 Update 阶段指标 ---
-                if local_rank <= 0:
-                    swanlab.log({
-                        "update/total_loss": avg_loss,
-                        "update/train_acc": train_acc,
-                        "update/clf_loss": loss_clf.item(),
-                        "update/kd_loss": kd_loss.item() if isinstance(kd_loss, torch.Tensor) else kd_loss,
-                        "update/infonce_loss": infonce_loss.item(),
-                        "epoch": epoch
-                    })
-                # -------------------------------
 
                 prog_bar.set_description(
                     f"Task {self._cur_task} Epoch {epoch + 1}/{epochs} Loss {losses / len(train_loader):.3f} Acc {train_acc:.2f}")
@@ -475,7 +591,7 @@ def infoNCE_loss(feats, t):
     nll = -cos_sim[pos_mask] + torch.logsumexp(cos_sim, dim=-1)
     return nll.mean()
 
-
+"""
 def infoNCE_distill_loss(p_feats, z_feats, t):
     cos_sim = F.cosine_similarity(p_feats[:, None, :], z_feats[None, :, :], dim=-1)
     self_mask = torch.eye(cos_sim.shape[0], dtype=torch.bool, device=cos_sim.device)
@@ -484,3 +600,22 @@ def infoNCE_distill_loss(p_feats, z_feats, t):
     cos_sim = cos_sim / t
     nll = -cos_sim[pos_mask] + torch.logsumexp(cos_sim, dim=-1)
     return nll.mean()
+"""
+
+
+def infoNCE_distill_loss(p_feats, z_feats, t):
+    # p_feats: [N*V, Dim], z_feats: [N*V, Dim]
+    # 归一化特征
+    p_feats = F.normalize(p_feats, dim=-1)
+    z_feats = F.normalize(z_feats, dim=-1)
+
+    # 1. 计算所有样本对之间的余弦相似度矩阵 [N*V, N*V]
+    cos_sim = torch.matmul(p_feats, z_feats.T) / t
+
+    # 2. 确定正确的正样本掩码：对角线上的才是同一个样本的视图对齐
+    # 因为 p_feats 和 z_feats 的顺序是一一对应的 (N*V)
+    labels = torch.arange(p_feats.size(0)).to(p_feats.device)
+
+    # 3. 使用交叉熵计算 InfoNCE (这会自动把对角线当做正样本，其他当做负样本)
+    loss = F.cross_entropy(cos_sim, labels)
+    return loss

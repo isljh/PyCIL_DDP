@@ -180,7 +180,8 @@ class iImageNet100_AA(iImageNet100):
     # class_order 记得改为 np.arange(100).tolist()
 
 class MultiViewTransform:
-    def __init__(self, size_global=224, size_local=98):
+    def __init__(self, size_global=224, size_local=98, train=True):
+        self.train = train
         # 基础增强算子（参考官方参数）
         self.common_ops = [
             transforms.RandomHorizontalFlip(p=0.5),
@@ -205,7 +206,18 @@ class MultiViewTransform:
             *self.common_ops
         ])
 
+        self.test_transform = transforms.Compose([
+            transforms.Resize(256),
+            transforms.CenterCrop(224),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225))
+        ])
+
     def __call__(self, img):
+        if not self.train:
+            # 测试模式：返回 [1, 3, 224, 224]
+            return self.test_transform(img)
+        # 训练模式
         views = []
         # 2 个全局视图
         for _ in range(2):
@@ -216,34 +228,8 @@ class MultiViewTransform:
         # 拼接成 [8, 3, 224, 224]
         return torch.stack(views)
 
-# 在你的 data.py 类里应用它
 class iImageNet100_LeJEPA(iImageNet100):
     use_path = True
-    # 覆盖原有的 train_trsf
-    train_trsf = [MultiViewTransform(size_global=224, size_local=98)]
+    train_trsf = [MultiViewTransform(size_global=224, size_local=98, train=True)]
+    test_trsf = [MultiViewTransform(size_global=224, size_local=98, train=False)]
     common_trsf = []
-
-'''   
-class iImageNet100_LeJEPA(iImageNet100):
-    use_path = True
-    train_trsf = [
-        # 1. 尺度缩放
-        transforms.RandomResizedCrop(224, scale=(0.08, 1.0)),
-        # 2. 水平翻转
-        transforms.RandomHorizontalFlip(p=0.5),
-        # 3. 颜色抖动
-        transforms.RandomApply([
-            transforms.ColorJitter(0.8, 0.8, 0.8, 0.2)
-        ], p=0.8),
-        # 4. 随机灰度化
-        transforms.RandomGrayscale(p=0.2),
-        # 5. 高斯模糊（ImageNet 分辨率大，必须加模糊来抵消纹理作弊）
-        transforms.RandomApply([
-            transforms.GaussianBlur(kernel_size=23, sigma=(0.1, 2.0))
-        ], p=0.5),
-        # 6. 太阳化
-        transforms.RandomApply([
-            transforms.RandomSolarize(threshold=128)
-        ], p=0.2),
-    ]
-'''

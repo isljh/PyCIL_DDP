@@ -17,14 +17,15 @@
     "infonce_kd_temp":0.2,
     "ta_convnet_type":"resnet18",
     "proj_hidden_dim":2048,
-    "proj_output_dim":1024,
+    "proj_output_dim":16,
     "attn_num_heads":8,
     "contrast_factor":1,
     "trans_cls_factor":1,
     "transfer_factor":1,
     "aux_factor":2,
     "contrast_kd_factor":2,
-    "aug":2,
+    "aug":1,
     "num_views": 8,
-    "lejepa_lambda": 0.05
+    "lejepa_lambda": 0.05,
+    "is_distributed": true
 }
