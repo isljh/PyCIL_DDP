@@ -69,40 +69,7 @@ class SIGReg(nn.Module):
         # 3. 计算统计量
         statistic = (err @ weights) * proj.size(-2)
         return statistic.mean()
-"""
 
-
-class SIGReg(nn.Module):
-    def __init__(self, in_dim=1024, proj_dim=256, knots=17):
-        super().__init__()
-        t = torch.linspace(0, 3, knots, dtype=torch.float32)
-        dt = 3 / (knots - 1)
-        weights = torch.full((knots,), 2 * dt, dtype=torch.float32)
-        weights[[0, -1]] = dt
-        window = torch.exp(-t.square() / 2.0)
-
-        self.register_buffer("t", t)
-        self.register_buffer("phi", window)
-        self.register_buffer("weights", weights * window)
-
-        # ✅ 固定投影矩阵，不再随 batch 随机生成
-        A = torch.randn(in_dim, proj_dim)
-        A = A.div_(A.norm(p=2, dim=0))
-        self.register_buffer("projection_A", A)
-
-    def forward(self, proj):
-        # 如果输入的 dim 变了（比如从 1024 变 512），自动重新适配，防止报错
-        if proj.size(-1) != self.projection_A.size(0):
-            device = proj.device
-            new_A = torch.randn(proj.size(-1), 256, device=device)
-            new_A = new_A.div_(new_A.norm(p=2, dim=0))
-            self.projection_A = new_A  # 临时更新
-
-        x_t = (proj @ self.projection_A).unsqueeze(-1) * self.t
-        err = (x_t.cos().mean(-3) - self.phi).square() + x_t.sin().mean(-3).square()
-        statistic = (err @ self.weights) * proj.size(-2)
-        return statistic.mean()
-"""
 class TagFex(BaseLearner):
     def __init__(self, args):
         super().__init__(args)
@@ -154,18 +121,7 @@ class TagFex(BaseLearner):
 
         local_rank = self.args.get("local_rank", 0)
         is_distributed = self.args.get("is_distributed", False)
-        """
-        # --- SwanLab 初始化 ---
-        if local_rank <= 0:
-            # 每个任务开始时，初始化或更新实验记录
-            swanlab.init(
-                project="PyCIL_TagFex",
-                experiment_name=f"Task_{self._cur_task}",
-                config=self.args,  # 自动记录所有传入的 args
-                suffix="timestamp"  # 防止重名
-            )
-        # ---------------------
-        """
+
         # --- 新增：自动计算每个 GPU 的 batch_size ---
         if is_distributed:
             import torch.distributed as dist
@@ -294,33 +250,7 @@ class TagFex(BaseLearner):
         local_rank = self.args.get("local_rank", 0)
         disable_tqdm = (local_rank > 0)
         prog_bar = tqdm(range(init_epoch), disable=disable_tqdm)
-        """
-        # --- 1. 重新配置符合 LeJEPA 要求的优化器与调度器 ---
-        # 判断是否被 DDP 包装
-        if hasattr(self._network, "module"):
-            base_model = self._network.module
-        else:
-            base_model = self._network
-        base_lr = 5e-4
-        params = [
-            {"params": base_model.convnets.parameters(), "lr": base_lr, "weight_decay": 5e-4},
-            {"params": base_model.fc.parameters(), "lr": 1e-3, "weight_decay": 1e-7},
-            {"params": base_model.ta_net.parameters(), "lr": base_lr, "weight_decay": 5e-4},
-            {"params": base_model.projector.parameters(), "lr": base_lr, "weight_decay": 5e-4}
-        ]
 
-        if base_model.aux_fc is not None:
-            params.append({"params": base_model.aux_fc.parameters(), "lr": 1e-3})
-
-        optimizer = torch.optim.AdamW(params)
-
-        # 官方要求：必须包含 1 个 Epoch 的线性 Warmup
-        warmup_steps = len(train_loader)
-        total_steps = len(train_loader) * init_epoch
-        s1 = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=0.01, total_iters=warmup_steps)
-        s2 = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_steps - warmup_steps, eta_min=base_lr/1000)
-        scheduler = torch.optim.lr_scheduler.SequentialLR(optimizer, schedulers=[s1, s2], milestones=[warmup_steps])
-        """
         V_dim = self.args.get('num_views', 8)
         lamb = self.args.get('lejepa_lambda', 0.05)
 
@@ -408,22 +338,7 @@ class TagFex(BaseLearner):
 
             if not disable_tqdm:
                 train_acc = np.around(correct * 100 / total, decimals=2)
-                '''
-                avg_loss = losses / len(train_loader)
-                # --- SwanLab 记录 Init 阶段指标 ---
-                if local_rank <= 0:
-                    swanlab.log({
-                        "init/total_loss": avg_loss,
-                        "init/train_acc": train_acc,
-                        "init/Prediction_Invariance_loss": inv_loss.item(),
-                        "init/SIGReg_loss": sigreg_loss.item(),
-                        "init/LeJEPA_total_loss": lejepa_loss.item(),
-                        "init/ce_loss": ce_loss.item(),
-                        "init/lr": optimizer.param_groups[0]['lr'],
-                        "epoch": epoch
-                    })
-                # -------------------------------
-                '''
+
                 prog_bar.set_description(
                     f"Task {self._cur_task}, Epoch {epoch + 1}/{init_epoch} Loss {losses / len(train_loader):.3f}, Acc {train_acc:.2f}")
 

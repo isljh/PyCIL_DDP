@@ -17,7 +17,7 @@
     "infonce_kd_temp":0.2,
     "ta_convnet_type":"resnet18",
     "proj_hidden_dim":2048,
-    "proj_output_dim":16,
+    "proj_output_dim":1024,
     "attn_num_heads":8,
     "contrast_factor":1,
     "trans_cls_factor":1,

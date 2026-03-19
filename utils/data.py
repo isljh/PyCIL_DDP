@@ -160,6 +160,8 @@ class iImageNet100(iData):
         #assert 0, "You should specify the folder of your dataset"
         train_dir = "/media/DATASET/person_data/ImageNet100/train/"
         test_dir = "/media/DATASET/person_data/ImageNet100/val/"
+        #train_dir = "E:/continual-learning/datasets/ImageNet100/train"
+        #test_dir = "E:/continual-learning/datasets/ImageNet100/val"
 
         train_dset = datasets.ImageFolder(train_dir)
         test_dset = datasets.ImageFolder(test_dir)
